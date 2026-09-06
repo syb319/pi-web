@@ -5,6 +5,7 @@ import path from "path";
 export interface BrowsableDirectory {
   name: string;
   path: string;
+  modifiedAt?: number;
 }
 
 export function shouldShowWindowsDrivePicker(
@@ -60,18 +61,23 @@ export async function resolveDirectory(directory: string): Promise<string> {
 export async function listDirectories(directory: string): Promise<BrowsableDirectory[]> {
   const entries = await readdir(directory, { withFileTypes: true });
   // 忽略损坏、不可访问或不指向目录的符号链接。
-  const candidates = await Promise.all(entries.map(async (entry) => {
+  const candidates: Array<BrowsableDirectory | null> = await Promise.all(entries.map(async (entry) => {
+    const entryPath = path.join(directory, entry.name);
     if (entry.isDirectory()) {
-      return { name: entry.name, path: path.join(directory, entry.name) };
+      try {
+        const entryStat = await stat(entryPath);
+        return { name: entry.name, path: entryPath, modifiedAt: entryStat.mtimeMs };
+      } catch {
+        return null;
+      }
     }
     if (!entry.isSymbolicLink()) return null;
 
     try {
-      const entryPath = path.join(directory, entry.name);
       const realEntryPath = await realpath(entryPath);
       const entryStat = await stat(realEntryPath);
       if (!entryStat.isDirectory()) return null;
-      return { name: entry.name, path: entryPath };
+      return { name: entry.name, path: entryPath, modifiedAt: entryStat.mtimeMs };
     } catch {
       return null;
     }
@@ -79,5 +85,8 @@ export async function listDirectories(directory: string): Promise<BrowsableDirec
 
   return candidates
     .filter((entry): entry is BrowsableDirectory => entry !== null)
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .sort((left, right) => {
+      const modifiedDifference = (right.modifiedAt ?? 0) - (left.modifiedAt ?? 0);
+      return modifiedDifference || left.name.localeCompare(right.name);
+    });
 }

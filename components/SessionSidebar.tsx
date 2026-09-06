@@ -159,7 +159,30 @@ interface ValidatedProject {
 
 const UNREAD_SESSIONS_STORAGE_KEY = "pi-web:unread-session-ids";
 const LAST_CUSTOM_CWD_STORAGE_KEY = "pi-web:last-custom-cwd";
+const HIDDEN_PROJECT_KEYS_STORAGE_KEY = "pi-web:hidden-project-keys";
 const RUNNING_SESSIONS_POLL_MS = 2500;
+
+function loadHiddenProjectKeys(): Set<string> {
+  if (typeof window === "undefined") return new Set();
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(HIDDEN_PROJECT_KEYS_STORAGE_KEY) ?? "[]") as unknown;
+    return Array.isArray(parsed)
+      ? new Set(parsed.filter((key): key is string => typeof key === "string" && key.length > 0))
+      : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveHiddenProjectKeys(keys: Set<string>): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (keys.size === 0) window.localStorage.removeItem(HIDDEN_PROJECT_KEYS_STORAGE_KEY);
+    else window.localStorage.setItem(HIDDEN_PROJECT_KEYS_STORAGE_KEY, JSON.stringify([...keys]));
+  } catch {
+    // Persistence is best-effort.
+  }
+}
 
 function loadLastCustomCwd(): string {
   if (typeof window === "undefined") return "";
@@ -387,6 +410,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [customPathError, setCustomPathError] = useState<string | null>(null);
   const [customPathValidating, setCustomPathValidating] = useState(false);
   const [validatedProject, setValidatedProject] = useState<ValidatedProject | null>(null);
+  const [hiddenProjectKeys, setHiddenProjectKeys] = useState<Set<string>>(loadHiddenProjectKeys);
   const dropdownRef = useRef<HTMLDivElement>(null);
   // Worktree switcher state
   const [worktreeState, setWorktreeState] = useState<WorktreeState | null>(null);
@@ -402,6 +426,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [explorerKey, setExplorerKey] = useState(0);
   const [explorerUploadBusy, setExplorerUploadBusy] = useState(false);
+  const [openDirectoryState, setOpenDirectoryState] = useState<"idle" | "opening" | "success" | "error">("idle");
   const [fileSearchOpen, setFileSearchOpen] = useState(false);
   const [sessionSearchOpen, setSessionSearchOpen] = useState(false);
   const [sessionSearchQuery, setSessionSearchQuery] = useState("");
@@ -418,7 +443,32 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   // running state; late /api/sessions responses must not overwrite it.
   const runningPollAuthoritativeRef = useRef(false);
   const explorerRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const openDirectoryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileExplorerRef = useRef<FileExplorerHandle>(null);
+
+  useEffect(() => () => {
+    if (openDirectoryTimerRef.current) clearTimeout(openDirectoryTimerRef.current);
+  }, []);
+
+  const handleOpenDirectory = useCallback(async () => {
+    const cwd = selectedCwd ?? selectedCwdProp;
+    if (!cwd || openDirectoryState === "opening") return;
+    if (openDirectoryTimerRef.current) clearTimeout(openDirectoryTimerRef.current);
+    setOpenDirectoryState("opening");
+    try {
+      const response = await fetch("/api/cwd/open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setOpenDirectoryState("success");
+    } catch {
+      setOpenDirectoryState("error");
+    } finally {
+      openDirectoryTimerRef.current = setTimeout(() => setOpenDirectoryState("idle"), 2000);
+    }
+  }, [openDirectoryState, selectedCwd, selectedCwdProp]);
 
   // Virtualized session list: only the visible window of rows is mounted.
   const listScrollRef = useRef<HTMLDivElement>(null);
@@ -510,6 +560,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   useEffect(() => {
     saveUnreadSessionIds(unreadSessionIds);
   }, [unreadSessionIds]);
+
+  useEffect(() => {
+    saveHiddenProjectKeys(hiddenProjectKeys);
+  }, [hiddenProjectKeys]);
 
   useEffect(() => {
     let stopped = false;
@@ -762,10 +816,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         // Session not found — notify parent so it can show the placeholder
         onInitialRestoreDone?.();
       }
-      const projects = getRecentProjects(allSessions);
+      const projects = getRecentProjects(allSessions).filter((project) => !hiddenProjectKeys.has(project.key));
       if (projects.length > 0) setSelectedCwd(projects[0].root);
     }
-  }, [allSessions, selectedCwd, initialSessionId, skipInitialProjectSelection, onSelectSession, onInitialRestoreDone]);
+  }, [allSessions, selectedCwd, initialSessionId, skipInitialProjectSelection, onSelectSession, onInitialRestoreDone, hiddenProjectKeys]);
 
   // Prefer an exact UI selection while a refetch is in flight. Once the
   // response catches up, the server-resolved path handles Windows case and
@@ -805,6 +859,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         cwd: data.cwd,
         root: data.projectRoot,
         key: data.projectKey,
+      });
+      setHiddenProjectKeys((previous) => {
+        if (!previous.has(data.projectKey!)) return previous;
+        const next = new Set(previous);
+        next.delete(data.projectKey!);
+        return next;
       });
       saveLastCustomCwd(data.cwd);
       setCustomPathValue(data.cwd);
@@ -945,14 +1005,25 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     onNewSession?.(tempId, selectedCwd);
   }, [selectedCwd, onNewSession]);
 
-  const recentProjects = getRecentProjects(allSessions);
+  const selectedProject = projectFor(selectedCwd);
+  const recentProjects = getRecentProjects(allSessions).filter(
+    (project) => !hiddenProjectKeys.has(project.key) || project.key === selectedProject?.key,
+  );
   const showProjectFilter = recentProjects.length > 8;
   const visibleProjects = projectFilter.trim()
     ? recentProjects.filter((project) => project.root.toLowerCase().includes(projectFilter.trim().toLowerCase()))
     : recentProjects;
 
-  // Sessions of every worktree in the selected project are shown together
-  const selectedProject = projectFor(selectedCwd);
+  const handleRemoveProject = useCallback((projectKey: string, projectRoot: string) => {
+    if (projectKey === selectedProject?.key) return;
+    if (!window.confirm(t("sidebar.removeProjectConfirm", { path: projectRoot }))) return;
+    setHiddenProjectKeys((previous) => new Set(previous).add(projectKey));
+    setProjectFilter("");
+  }, [selectedProject?.key, t]);
+
+  const handleRestoreProjects = useCallback(() => {
+    setHiddenProjectKeys(new Set());
+  }, []);
 
   // Per-project activity counts (running / unread) for the workspace selector.
   // Uses the same stable server key as the project list and filtering.
@@ -1199,50 +1270,86 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 </div>
               )}
               <div style={{ maxHeight: "min(50vh, 380px)", overflowY: "auto" }}>
-                {visibleProjects.map((project) => (
-                  <button
-                    key={project.key}
-                    onClick={() => {
-                      setSelectedCwd(project.root);
-                      setProjectFilter("");
-                      setCustomPathOpen(false);
-                      setCustomPathError(null);
-                      setDropdownOpen(false);
-                    }}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 7,
-                      width: "100%",
-                      padding: "8px 10px",
-                      background: "var(--bg)",
-                      border: "none",
-                      borderBottom: "1px solid var(--border)",
-                      color: project.key === selectedProject?.key ? "var(--text)" : "var(--text-muted)",
-                      cursor: "pointer",
-                      textAlign: "left",
-                      fontSize: 11,
-                      fontFamily: "var(--font-mono)",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={project.root}
-                  >
-                    {project.key === selectedProject?.key && (
-                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-                        <polyline points="1.5 5 4 7.5 8.5 2.5" />
-                      </svg>
-                    )}
-                    {project.key !== selectedProject?.key && <span style={{ width: 10, flexShrink: 0 }} />}
-                    <PathLabel text={displayCwd(project.root, homeDir)} style={{ flex: 1 }} />
-                    {showProjectActivity(projectActivity.get(project.key), t)}
-                  </button>
-                ))}
+                {visibleProjects.map((project) => {
+                  const isSelected = project.key === selectedProject?.key;
+                  const isRunning = (projectActivity.get(project.key)?.running ?? 0) > 0;
+                  const cannotRemove = isSelected || isRunning;
+                  const removeTitle = isSelected
+                    ? t("sidebar.removeCurrentProjectTitle")
+                    : isRunning
+                      ? t("sidebar.removeRunningProjectTitle")
+                      : t("sidebar.removeProjectFromList");
+                  return (
+                    <div key={project.key} style={{ display: "flex", alignItems: "stretch", width: "100%", background: "var(--bg)", borderBottom: "1px solid var(--border)" }}>
+                      <button
+                        onClick={() => {
+                          setSelectedCwd(project.root);
+                          setProjectFilter("");
+                          setCustomPathOpen(false);
+                          setCustomPathError(null);
+                          setDropdownOpen(false);
+                        }}
+                        style={{
+                          display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0,
+                          padding: "8px 6px 8px 10px", background: "none", border: "none",
+                          color: isSelected ? "var(--text)" : "var(--text-muted)", cursor: "pointer",
+                          textAlign: "left", fontSize: 11, fontFamily: "var(--font-mono)", overflow: "hidden",
+                        }}
+                        title={project.root}
+                      >
+                        {isSelected && (
+                          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                            <polyline points="1.5 5 4 7.5 8.5 2.5" />
+                          </svg>
+                        )}
+                        {!isSelected && <span style={{ width: 10, flexShrink: 0 }} />}
+                        <PathLabel text={displayCwd(project.root, homeDir)} style={{ flex: 1 }} />
+                        {showProjectActivity(projectActivity.get(project.key), t)}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cannotRemove}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleRemoveProject(project.key, project.root);
+                        }}
+                        title={removeTitle}
+                        aria-label={`${removeTitle}: ${project.root}`}
+                        style={{
+                          width: 30, flexShrink: 0, padding: 0, background: "none", border: "none",
+                          color: "var(--text-dim)", cursor: cannotRemove ? "default" : "pointer",
+                          opacity: cannotRemove ? 0.25 : 0.7, fontSize: 16, lineHeight: 1,
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
                 {visibleProjects.length === 0 && projectFilter.trim() && (
                    <div style={{ padding: "8px 10px", fontSize: 11, color: "var(--text-dim)" }}>{t("sidebar.noMatchingProjects")}</div>
                 )}
               </div>
+
+              {hiddenProjectKeys.size > 0 && !customPathOpen && (
+                <button
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    handleRestoreProjects();
+                  }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 7, width: "100%", padding: "8px 10px",
+                    background: "none", border: "none", borderTop: visibleProjects.length > 0 ? "1px solid var(--border)" : "none",
+                    color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11,
+                  }}
+                >
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                    <path d="M1.5 5a3.5 3.5 0 1 0 1-2.45" />
+                    <path d="M1 1.5v2.5h2.5" />
+                  </svg>
+                  <span>{t("sidebar.restoreRemovedProjects")}</span>
+                </button>
+              )}
 
               {/* Default cwd shortcut */}
               {!customPathOpen && (
@@ -1780,6 +1887,30 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
               </svg>
               {t("files.explorer")}
             </button>
+            {explorerOpen && (
+              <ToolbarIconButton
+                onClick={() => void handleOpenDirectory()}
+                disabled={openDirectoryState === "opening"}
+                title={openDirectoryState === "error" ? t("sidebar.openFolderFailed") : openDirectoryState === "opening" ? t("sidebar.openingFolder") : t("sidebar.openFolder")}
+                skipHover={openDirectoryState === "success" || openDirectoryState === "error"}
+                color={openDirectoryState === "success" ? "#4ade80" : openDirectoryState === "error" ? "#f87171" : "var(--text-dim)"}
+                background={openDirectoryState === "success" ? "rgba(74,222,128,0.18)" : openDirectoryState === "error" ? "rgba(248,113,113,0.14)" : "none"}
+              >
+                {openDirectoryState === "success" ? (
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="m5 12 4 4L19 6" />
+                  </svg>
+                ) : openDirectoryState === "error" ? (
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true">
+                    <path d="m6 6 12 12" /><path d="m18 6-12 12" />
+                  </svg>
+                ) : (
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+                  </svg>
+                )}
+              </ToolbarIconButton>
+            )}
             {onOpenTerminal && (
               <ToolbarIconButton
                 onClick={() => onOpenTerminal(selectedCwd ?? selectedCwdProp!)}

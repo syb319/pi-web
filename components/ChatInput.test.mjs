@@ -11,7 +11,7 @@ const jiti = createJiti(import.meta.url, {
 });
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, compressImageFile, filterModelOptions, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isExactSlashCommand, modelSupportsImageInput, shouldCompressImageFile } = await jiti.import("./ChatInput.tsx");
+const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, compressImageFile, filterModelOptions, getClipboardFiles, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isClipboardPasteShortcut, isExactSlashCommand, modelSupportsImageInput, partitionComposerFiles, shouldCompressImageFile, shouldReadSystemFileClipboard } = await jiti.import("./ChatInput.tsx");
 const { ModelSelector } = await jiti.import("./ModelSelector.tsx");
 const { clearDraft, getDraft, mergeRestoredSubmissionDraft, mergeRestoredSubmissionText, rekeyDraft, setDraft } = await jiti.import("@/lib/draft-store.ts");
 const { I18nProvider } = await jiti.import("@/hooks/useI18n");
@@ -55,6 +55,13 @@ test("follow-up shortcuts preserve newline, IME, mobile and completion behavior"
     const handler = script.runInNewContext({
       Date: { now: () => 1000 },
       COMPOSITION_END_ENTER_GRACE_MS: 100,
+      compact: false,
+      isClipboardPasteShortcut,
+      pasteSequenceRef: { current: 0 },
+      pasteFallbackTimerRef: { current: null },
+      pasteSystemClipboardFiles() {},
+      clearTimeout() {},
+      setTimeout() { return 1; },
       isMobile: false, isStreaming: true,
       isComposingRef: { current: false }, lastCompositionEndAtRef: { current: 0 },
       historyMenuOpen: false, inputHistory: ["previous"], historyActiveIndex: 0,
@@ -280,6 +287,29 @@ test("renders the shared field model selector as a disabled gray control", () =>
 test("caps an upward menu to the visible space above its anchor", () => {
   assert.equal(getUpwardMenuMaxHeight(343, 36), 299);
   assert.equal(getUpwardMenuMaxHeight(40, 36), 0);
+});
+
+test("extracts and partitions clipboard files", () => {
+  const image = { name: "screenshot.png", type: "image/png" };
+  const document = { name: "notes.pdf", type: "application/pdf" };
+  const files = getClipboardFiles({
+    items: [
+      { kind: "string", getAsFile: () => null },
+      { kind: "file", getAsFile: () => image },
+      { kind: "file", getAsFile: () => document },
+    ],
+    files: [],
+  });
+  assert.deepEqual(files, [image, document]);
+  assert.deepEqual(partitionComposerFiles(files), { imageFiles: [image], projectFiles: [document] });
+});
+
+test("uses native clipboard fallback only for empty paste shortcuts", () => {
+  assert.equal(shouldReadSystemFileClipboard([], ""), true);
+  assert.equal(shouldReadSystemFileClipboard([], "plain text"), false);
+  assert.equal(isClipboardPasteShortcut("v", true, false), true);
+  assert.equal(isClipboardPasteShortcut("V", false, true), true);
+  assert.equal(isClipboardPasteShortcut("c", true, false), false);
 });
 
 test("compresses large images while preserving small images and GIFs", async () => {

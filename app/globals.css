@@ -1151,6 +1151,11 @@ pre, code {
   }
 }
 
+/* Hide the Next.js development toolbar while Pi Web runs in dev mode. */
+nextjs-portal {
+  display: none !important;
+}
+
 @media (max-width: 380px) {
   .file-viewer-toolbar {
     gap: 6px !important;

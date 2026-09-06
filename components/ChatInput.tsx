@@ -19,9 +19,10 @@ import {
   isBase64ImageWithinLimits,
 } from "@/lib/image-attachments";
 import {
-  buildEntriesFromFiles, buildAtInsertText, extractAtQuery, filterFileEntries,
+  buildEntriesFromFiles, buildAtInsertText, buildFileAtMentionsText, extractAtQuery, filterFileEntries,
   type AtQueryMatch, type FileIndexEntry,
 } from "@/lib/file-fuzzy";
+import { encodeFilePathForApi } from "@/lib/file-paths";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/hooks/useI18n";
@@ -35,6 +36,34 @@ export interface AttachedImage {
   data: string;   // base64, no prefix
   mimeType: string;
   previewUrl: string; // object URL for display
+}
+
+interface ClipboardFileData {
+  items: ArrayLike<{ kind: string; getAsFile: () => File | null }>;
+  files: ArrayLike<File>;
+}
+
+export function getClipboardFiles(clipboardData: ClipboardFileData): File[] {
+  const filesFromItems = Array.from(clipboardData.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+  return filesFromItems.length > 0 ? filesFromItems : Array.from(clipboardData.files);
+}
+
+export function partitionComposerFiles(files: File[]): { imageFiles: File[]; projectFiles: File[] } {
+  return {
+    imageFiles: files.filter((file) => file.type.startsWith("image/")),
+    projectFiles: files.filter((file) => !file.type.startsWith("image/")),
+  };
+}
+
+export function shouldReadSystemFileClipboard(files: File[], plainText: string): boolean {
+  return files.length === 0 && plainText.length === 0;
+}
+
+export function isClipboardPasteShortcut(key: string, ctrlKey: boolean, metaKey: boolean): boolean {
+  return key.toLowerCase() === "v" && (ctrlKey || metaKey);
 }
 
 interface Props {
@@ -88,6 +117,7 @@ export interface ChatInputHandle {
   replaceMessage: (message: UserMessage) => void;
   prependText: (text: string) => void;
   addImages: (files: File[]) => void;
+  addFiles: (files: File[]) => void;
   rekeyDraft: (previousKey: string, nextKey: string) => void;
   restoreSubmission: (text: string, images?: ChatDraftImage[], targetDraftKey?: string) => void;
 }
@@ -493,6 +523,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>(() => (
     draftKey ? draftImagesToAttachedImages(getDraft(draftKey)?.images) : []
   ));
+  const [fileUploadState, setFileUploadState] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
   const trimmedValue = value.trimStart();
   const bashMode = attachedImages.length === 0 && trimmedValue.startsWith("!");
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
@@ -522,6 +553,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const controlsMenuRef = useRef<HTMLDivElement>(null);
   const historyMenuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const projectFileInputRef = useRef<HTMLInputElement>(null);
   const isComposingRef = useRef(false);
   const lastCompositionEndAtRef = useRef(0);
   const slashCommandsRequestedRef = useRef(false);
@@ -535,6 +567,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const valueRef = useRef(value);
   const attachedImagesRef = useRef(attachedImages);
   const pendingImageCountRef = useRef(0);
+  const pasteSequenceRef = useRef(0);
+  const pasteFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
 
@@ -717,6 +751,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     addImages(files: File[]) {
       processImageFiles(files);
     },
+    addFiles(files: File[]) {
+      const { imageFiles, projectFiles } = partitionComposerFiles(files);
+      if (imageFiles.length > 0) void processImageFiles(imageFiles);
+      if (projectFiles.length > 0) void uploadProjectFiles(projectFiles);
+    },
   }));
 
   const processImageFiles = useCallback(async (files: File[]) => {
@@ -748,6 +787,72 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       pendingImageCountRef.current -= imageFiles.length;
     }
   }, [compact]);
+
+  const appendUploadedFileMentions = useCallback((uploaded: string[]) => {
+    if (uploaded.length === 0) return;
+    const mentions = buildFileAtMentionsText(uploaded);
+    const nextValue = `${valueRef.current}${valueRef.current && !/\s$/.test(valueRef.current) ? " " : ""}${mentions}`;
+    valueRef.current = nextValue;
+    setValue(nextValue);
+    setAtQuery(null);
+  }, []);
+
+  const uploadProjectFiles = useCallback(async (files: File[]) => {
+    if (compact || files.length === 0 || fileUploadState.busy) return;
+    if (!cwd) {
+      setFileUploadState({ busy: false, error: t("chat.uploadFileRequiresProject") });
+      return;
+    }
+    setFileUploadState({ busy: true, error: null });
+    try {
+      const formData = new FormData();
+      files.forEach((file) => formData.append("files", file, file.name));
+      const response = await fetch(
+        `/api/files/${encodeFilePathForApi(cwd)}?type=upload&conflict=rename`,
+        { method: "POST", body: formData },
+      );
+      const result = await response.json().catch(() => ({})) as {
+        uploaded?: string[];
+        error?: string;
+        errors?: Array<{ name?: string; file?: string; error?: string }>;
+      };
+      if (!response.ok) throw new Error(result.error ?? `Upload failed (HTTP ${response.status})`);
+      const uploaded = result.uploaded ?? [];
+      appendUploadedFileMentions(uploaded);
+      const failure = result.errors?.map((item) => `${item.name ?? item.file ?? "File"}: ${item.error ?? "Upload failed"}`).join("\n");
+      setFileUploadState({ busy: false, error: failure || (uploaded.length ? null : "No files were uploaded") });
+    } catch (error) {
+      setFileUploadState({ busy: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }, [appendUploadedFileMentions, compact, cwd, fileUploadState.busy, t]);
+
+  const pasteSystemClipboardFiles = useCallback(async () => {
+    if (compact || fileUploadState.busy) return;
+    if (!cwd) {
+      setFileUploadState({ busy: false, error: t("chat.uploadFileRequiresProject") });
+      return;
+    }
+    setFileUploadState({ busy: true, error: null });
+    try {
+      const response = await fetch("/api/clipboard-files", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd }),
+      });
+      const result = await response.json().catch(() => ({})) as {
+        uploaded?: string[];
+        error?: string;
+        errors?: Array<{ name?: string; error?: string }>;
+      };
+      if (!response.ok) throw new Error(result.error ?? `Paste failed (HTTP ${response.status})`);
+      const uploaded = result.uploaded ?? [];
+      appendUploadedFileMentions(uploaded);
+      const failure = result.errors?.map((item) => `${item.name ?? "File"}: ${item.error ?? "Paste failed"}`).join("\n");
+      setFileUploadState({ busy: false, error: failure || (uploaded.length > 0 ? null : result.error ?? null) });
+    } catch (error) {
+      setFileUploadState({ busy: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }, [appendUploadedFileMentions, compact, cwd, fileUploadState.busy, t]);
 
   const removeImage = useCallback((index: number) => {
     setAttachedImages((prev) => {
@@ -1164,6 +1269,15 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         nativeEvent.isComposing ||
         nativeEvent.keyCode === 229;
 
+      if (!compact && isClipboardPasteShortcut(e.key, e.ctrlKey, e.metaKey)) {
+        const sequence = ++pasteSequenceRef.current;
+        if (pasteFallbackTimerRef.current !== null) clearTimeout(pasteFallbackTimerRef.current);
+        pasteFallbackTimerRef.current = setTimeout(() => {
+          pasteFallbackTimerRef.current = null;
+          if (pasteSequenceRef.current === sequence) void pasteSystemClipboardFiles();
+        }, 75);
+      }
+
       if (sendShortcut && (isComposing || recentlyComposed)) {
         if (recentlyComposed) e.preventDefault();
         return;
@@ -1288,7 +1402,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       }
     },
-    [isMobile, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
+    [compact, isMobile, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, pasteSystemClipboardFiles, value]
   );
 
   const handleInput = useCallback(() => {
@@ -1298,15 +1412,30 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
   }, []);
 
+  useEffect(() => () => {
+    if (pasteFallbackTimerRef.current !== null) clearTimeout(pasteFallbackTimerRef.current);
+  }, []);
+
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     if (compact) return;
-    const items = Array.from(e.clipboardData?.items ?? []);
-    const imageItems = items.filter((item) => item.type.startsWith("image/"));
-    if (!imageItems.length) return;
+    pasteSequenceRef.current += 1;
+    if (pasteFallbackTimerRef.current !== null) {
+      clearTimeout(pasteFallbackTimerRef.current);
+      pasteFallbackTimerRef.current = null;
+    }
+    const files = getClipboardFiles(e.clipboardData);
+    if (files.length > 0) {
+      e.preventDefault();
+      const { imageFiles, projectFiles } = partitionComposerFiles(files);
+      if (imageFiles.length > 0) void processImageFiles(imageFiles);
+      if (projectFiles.length > 0) void uploadProjectFiles(projectFiles);
+      return;
+    }
+    const plainText = e.clipboardData.getData("text/plain");
+    if (!shouldReadSystemFileClipboard(files, plainText)) return;
     e.preventDefault();
-    const files = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
-    processImageFiles(files);
-  }, [compact, processImageFiles]);
+    void pasteSystemClipboardFiles();
+  }, [compact, pasteSystemClipboardFiles, processImageFiles, uploadProjectFiles]);
 
   useEffect(() => {
     if (slashQuery === null) {
@@ -1485,6 +1614,17 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           e.target.value = "";
         }}
       />}
+      {!compact && <input
+        ref={projectFileInputRef}
+        type="file"
+        multiple
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          void uploadProjectFiles(files);
+        }}
+      />}
       <div style={{ maxWidth: "var(--chat-content-max-width, 820px)", margin: "0 auto" }}>
         <ModelErrorBanner error={modelError} />
         <ModelScopeWarningBanner warnings={modelScopeWarnings} />
@@ -1613,6 +1753,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             }}
           >
             {compactError}
+          </div>
+        )}
+        {!compact && fileUploadState.error && (
+          <div role="alert" style={{ marginBottom: 8, padding: "6px 10px", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 6, background: "rgba(239,68,68,0.07)", color: "#ef4444", fontSize: 12, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+            {fileUploadState.error}
           </div>
         )}
         {/* Image previews */}
@@ -2151,6 +2296,32 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
 
           {/* LEFT: attach + model selector (idle) or steer/followup toggle (streaming) */}
           <div style={{ flex: isMobile ? "1 1 auto" : "0 0 auto", minWidth: 0, display: "flex", alignItems: "center", gap: 2 }}>
+            <button
+              type="button"
+              onClick={() => projectFileInputRef.current?.click()}
+              disabled={!cwd || fileUploadState.busy}
+              title={!cwd ? t("chat.uploadFileRequiresProject") : t("chat.uploadFile")}
+              style={{
+                flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                width: 32, height: 32, padding: 0, background: "none", border: "none", borderRadius: 9,
+                color: fileUploadState.busy ? "var(--accent)" : "var(--text-muted)",
+                cursor: !cwd || fileUploadState.busy ? "not-allowed" : "pointer", opacity: !cwd ? 0.45 : 1,
+                transition: "background 0.12s, color 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                if (!cwd || fileUploadState.busy) return;
+                e.currentTarget.style.background = "var(--bg-hover)";
+                e.currentTarget.style.color = "var(--text)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "none";
+                e.currentTarget.style.color = fileUploadState.busy ? "var(--accent)" : "var(--text-muted)";
+              }}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-label={fileUploadState.busy ? t("chat.uploadingFile") : undefined}>
+                <path d="M12 3v12" /><path d="m7 8 5-5 5 5" /><path d="M5 21h14" />
+              </svg>
+            </button>
             <button
               onClick={() => fileInputRef.current?.click()}
              title={t("chat.attachImage")}

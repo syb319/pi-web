@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 
-export const UPLOAD_CONFLICT_STRATEGIES = ["error", "overwrite", "skip"] as const;
+export const UPLOAD_CONFLICT_STRATEGIES = ["error", "overwrite", "skip", "rename"] as const;
 export type UploadConflictStrategy = typeof UPLOAD_CONFLICT_STRATEGIES[number];
 
 const UPLOAD_CONFLICT_STRATEGY_SET = new Set<string>(UPLOAD_CONFLICT_STRATEGIES);
@@ -56,4 +56,25 @@ export function inspectUploadTargets(directory: string, fileNames: string[]): Up
   }
 
   return { conflicts, nonReplaceable };
+}
+
+/** Pick a non-conflicting basename without overwriting an existing file. */
+export function findAvailableUploadName(
+  directory: string,
+  originalName: string,
+  reservedNames: Set<string> = new Set(),
+): string {
+  const extension = path.extname(originalName);
+  const stem = extension ? originalName.slice(0, -extension.length) : originalName;
+  let candidate = originalName;
+  let suffix = 1;
+  while (
+    reservedNames.has(candidate.toLocaleLowerCase())
+    || fs.existsSync(path.join(directory, candidate))
+  ) {
+    candidate = `${stem} (${suffix})${extension}`;
+    suffix += 1;
+  }
+  reservedNames.add(candidate.toLocaleLowerCase());
+  return candidate;
 }
