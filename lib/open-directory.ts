@@ -19,8 +19,8 @@ export function getOpenDirectoryCommand(
       // local policy when Pi Web is started from a desktop shortcut.
       return {
         command: "explorer.exe",
-        args: [directory],
-        windowsHide: true,
+        args: [`/root,${directory}`],
+        windowsHide: false,
         waitForExit: false,
       };
     case "darwin":
